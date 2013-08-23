@@ -189,11 +189,11 @@ class GPGEncryptionFilter(PipelineCommand):
     """ Encrypt using GPG, using the provided public key ID. """
     def __init__(self, key, stdin=PIPE, stdout=PIPE):
         PipelineCommand.__init__(
-                self, [GPG_BIN, '-e', '-z', '0', '-r', '--trust-model always', key], stdin, stdout)
+                self, [GPG_BIN, '-e', '-z', '0', '--trust-model', 'always', '-r', key], stdin, stdout)
 
 
 class GPGDecryptionFilter(PipelineCommand):
     """ Decrypt using GPG (the private key must exist and be unpassworded). """
     def __init__(self, stdin=PIPE, stdout=PIPE):
         PipelineCommand.__init__(
-                self, [GPG_BIN, '-d', '-q', '--trust-model always'], stdin, stdout)
+                self, [GPG_BIN, '--trust-model', 'always', '-d', '-q'], stdin, stdout)
