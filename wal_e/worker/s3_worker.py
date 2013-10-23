@@ -9,7 +9,6 @@ import boto
 import boto.exception
 import gevent
 import json
-import logging
 import re
 import socket
 import tarfile
@@ -29,7 +28,7 @@ from wal_e.retries import retry, retry_with_count
 from wal_e.s3 import calling_format
 from wal_e.worker import s3_deleter
 
-logger = log_help.WalELogger(__name__, level=logging.INFO)
+logger = log_help.WalELogger(__name__)
 
 
 generic_weird_key_hint_message = ('This means an unexpected key was found in '
@@ -313,8 +312,20 @@ def do_lzop_s3_get(aws_access_key_id, aws_secret_access_key,
 
     @retry(retry_with_count(log_wal_fetch_failures_on_error))
     def download():
+        missing_uri_hint = ('This can be normal when Postgres is trying to '
+                            'detect what timelines are available during '
+                            'restoration.')
         with open(path, 'wb') as decomp_out:
             key = uri_to_key(aws_access_key_id, aws_secret_access_key, s3_url)
+            if not key.exists():
+                # Do not retry if the key not present, this can happen
+                # under normal situations.
+                logger.info(
+                    msg='could not locate object while performing wal restore',
+                    detail=('The absolute URI that could not be located '
+                            'is {url}.'.format(url=s3_url)),
+                    hint=missing_uri_hint)
+                return False
 
             pipeline = get_download_pipeline(PIPE, decomp_out, decrypt)
             g = gevent.spawn(write_and_close_thread, key, pipeline.stdin)
@@ -324,17 +335,14 @@ def do_lzop_s3_get(aws_access_key_id, aws_secret_access_key,
                 g.get()
             except boto.exception.S3ResponseError, e:
                 if e.status == 404:
-                    # Do not retry if the key not present, this can happen
-                    # under normal situations.
-                    logger.info(
-                        msg=('could not locate object while performing wal '
-                             'restore'),
-                        detail=('The absolute URI that could not be located '
-                                'is {url}.'.format(url=s3_url)),
-                        hint=('This can be normal when Postgres is trying to '
-                              'detect what timelines are available during '
-                              'restoration.'))
-
+                    # Short circuit any re-try attempts under certain race
+                    # conditions.
+                    logger.warn(
+                        msg=('could no longer locate object while performing '
+                             'wal restore'),
+                        detail=('The URI  at {url} no longer '
+                                'exists.'.format(url=s3_url)),
+                        hint=missing_uri_hint)
                     return False
                 else:
                     raise
@@ -443,7 +451,6 @@ class BackupList(object):
             all_backups = list(iter(self))
 
             if not all_backups:
-                yield None
                 return
 
             assert len(all_backups) > 0

@@ -4,6 +4,7 @@ archiving on S3: it handles pushing and fetching of WAL segments and
 base backups of the PostgreSQL data directory.
 
 """
+import sys
 
 
 def gevent_monkey(*args, **kwargs):
@@ -16,12 +17,59 @@ def gevent_monkey(*args, **kwargs):
 # sadly it cannot be used (easily) in WAL-E.
 gevent_monkey()
 
+# Instate a cipher suite that bans a series of weak and slow ciphers.
+# Both RC4 (weak) 3DES (slow) have been seen in use.
+#
+# Only Python 2.7+ possesses the 'ciphers' keyword to wrap_socket.
+if sys.version_info >= (2, 7):
+    def ssl_monkey():
+        import ssl
+
+        original = ssl.wrap_socket
+
+        def wrap_socket_monkey(*args, **kwargs):
+            # Set up an OpenSSL cipher string.
+            #
+            # Rationale behind each part:
+            #
+            # * HIGH: only use the most secure class of ciphers and
+            #   key lengths, generally being 128 bits and larger.
+            #
+            # * !aNULL: exclude cipher suites that contain anonymous
+            #   key exchange, making man in the middle attacks much
+            #   more tractable.
+            #
+            # * !SSLv2: exclude any SSLv2 cipher suite, as this
+            #   category has security weaknesses.  There is only one
+            #   OpenSSL cipher suite that is in the "HIGH" category
+            #   but uses SSLv2 protocols: DES_192_EDE3_CBC_WITH_MD5
+            #   (see s2_lib.c)
+            #
+            #   Technically redundant given "!3DES", but the intent in
+            #   listing it here is more apparent.
+            #
+            # * !RC4: exclude because it's a weak block cipher.
+            #
+            # * !3DES: exclude because it's very CPU intensive and
+            #   most peers support another reputable block cipher.
+            #
+            # * !MD5: although it doesn't seem use of known flaws in
+            #   MD5 is able to compromise an SSL session, the wide
+            #   deployment of SHA-family functions means the
+            #   compatibility benefits of allowing it are slim to
+            #   none, so disable it until someone produces material
+            #   complaint.
+            kwargs['ciphers'] = 'HIGH:!aNULL:!SSLv2:!RC4:!3DES:!MD5'
+            return original(*args, **kwargs)
+
+        ssl.wrap_socket = wrap_socket_monkey
+
+    ssl_monkey()
 
 import argparse
 import logging
 import os
 import re
-import sys
 import textwrap
 import traceback
 
@@ -40,7 +88,7 @@ from wal_e.worker.pg_controldata_worker import CONFIG_BIN, PgControlDataParser
 log_help.configure(
     format='%(name)-12s %(levelname)-8s %(message)s')
 
-logger = log_help.WalELogger('wal_e.main', level=logging.INFO)
+logger = log_help.WalELogger('wal_e.main')
 
 
 def external_program_check(
@@ -142,6 +190,10 @@ def main(argv=None):
         help='GPG key ID to encrypt to. (Also needed when decrypting.)  '
         'Can also be defined via environment variable '
         'WALE_GPG_KEY_ID')
+
+    parser.add_argument(
+        '--terse', action='store_true',
+        help='Only log messages as or more severe than a warning.')
 
     subparsers = parser.add_subparsers(title='subcommands',
                                        dest='subcommand')
@@ -265,6 +317,10 @@ def main(argv=None):
     # Okay, parse some arguments, finally
     args = parser.parse_args()
     subcommand = args.subcommand
+
+    # Adjust logging level if terse output is set.
+    if args.terse:
+        log_help.MINIMUM_LOG_LEVEL = logging.WARNING
 
     # Handle version printing specially, because it doesn't need
     # credentials.
@@ -399,8 +455,12 @@ def main(argv=None):
         # code management.
         if backup_cxt.exceptions:
             for exc in backup_cxt.exceptions[:-1]:
-                logger.log(level=exc.severity,
-                           msg=exc.msg, detail=exc.detail, hint=exc.hint)
+                if isinstance(exc, UserException):
+                    logger.log(level=exc.severity,
+                               msg=exc.msg, detail=exc.detail, hint=exc.hint)
+                else:
+                    logger.error(msg=exc)
+
             raise backup_cxt.exceptions[-1]
 
     except UserException, e:
